@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
 
 type streamFlushWriter struct {
+	mu        sync.Mutex
 	writer    io.Writer
 	flusher   http.Flusher
 	policy    string
@@ -30,18 +32,24 @@ func (w *streamFlushWriter) WriteString(data string) error {
 	if w == nil || w.writer == nil {
 		return nil
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writeStringLocked(data)
+}
+
+func (w *streamFlushWriter) writeStringLocked(data string) error {
 	if w.policy != StreamFlushPolicyCoalesce {
 		if _, err := io.WriteString(w.writer, data); err != nil {
 			return err
 		}
-		w.flushTransport()
+		w.flushTransportLocked()
 		return nil
 	}
 	if _, err := w.buffer.WriteString(data); err != nil {
 		return err
 	}
 	if w.lastFlush.IsZero() || time.Since(w.lastFlush) >= w.interval {
-		return w.Flush()
+		return w.flushLocked()
 	}
 	return nil
 }
@@ -57,17 +65,23 @@ func (w *streamFlushWriter) Flush() error {
 	if w == nil {
 		return nil
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.flushLocked()
+}
+
+func (w *streamFlushWriter) flushLocked() error {
 	if w.buffer.Len() > 0 {
 		if _, err := w.writer.Write(w.buffer.Bytes()); err != nil {
 			return err
 		}
 		w.buffer.Reset()
 	}
-	w.flushTransport()
+	w.flushTransportLocked()
 	return nil
 }
 
-func (w *streamFlushWriter) flushTransport() {
+func (w *streamFlushWriter) flushTransportLocked() {
 	if w == nil || w.flusher == nil {
 		return
 	}
