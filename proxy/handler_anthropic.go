@@ -280,6 +280,9 @@ func (h *Handler) Messages(c *gin.Context) {
 			translator := newAnthropicStreamTranslator(originalModel)
 			streamWriter := newStreamFlushWriter(c.Writer, flusher)
 
+			// 【高能核心修复 1/2】引入时间记录指针，初始化为当前时间
+			lastWriteTime := time.Now()
+
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
@@ -314,6 +317,22 @@ func (h *Handler) Messages(c *gin.Context) {
 						return false
 					}
 					wroteAnyBody = true
+					// 只要真正向下游吐了数据，就刷新最后写入时间
+					lastWriteTime = time.Now()
+				}
+
+				// 【高能核心修复 2/2】
+				// 如果满足以下条件：
+				// 1. 刚才翻译器憋数据了（没有产生实际的 events 导致没进上面的循环）
+				// 2. 距离上一次真正给下游客户端发数据，已经憋了超过 3 秒了
+				// 那就强行向下游注入一个标准的 SSE 注释行刷新连接活性，彻底解决 499 憋死问题！
+				if len(events) == 0 && time.Since(lastWriteTime) > 3*time.Second {
+					if err := streamWriter.WriteString(": keepalive\n\n"); err != nil {
+						writeErr = err
+						return false
+					}
+					// 刷新时间，防止后续高频无用包导致密集轰击心跳
+					lastWriteTime = time.Now()
 				}
 
 				return eventType != "response.completed" && eventType != "response.failed"
