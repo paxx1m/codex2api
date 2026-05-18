@@ -761,8 +761,36 @@ func (t *anthropicStreamTranslator) handleToolInputDelta(data []byte) []anthropi
 	if delta == "" {
 		return nil
 	}
+
+	// 如果 response.output_item.added 没有触发（上游跳过），在此懒开 tool_use block，
+	// 防止 content_block_stop 在没有对应 content_block_start 的情况下发出。
+	var events []anthropicStreamEvent
+	if !t.messageStartSent {
+		events = append(events, t.handleCreated()...)
+	}
+	if !t.contentBlockOpen || t.currentBlockType != "tool_use" {
+		events = append(events, t.closeCurrentBlock()...)
+		callID := t.currentToolUseID
+		name := t.currentToolUseName
+		idx := t.contentBlockIndex
+		t.contentBlockIndex++
+		t.contentBlockOpen = true
+		t.currentBlockType = "tool_use"
+		t.hasToolUse = true
+		events = append(events, anthropicStreamEvent{
+			Type:  "content_block_start",
+			Index: &idx,
+			ContentBlock: &anthropicContentBlock{
+				Type:  "tool_use",
+				ID:    callID,
+				Name:  name,
+				Input: json.RawMessage("{}"),
+			},
+		})
+	}
+
 	t.currentToolInputBuffer.WriteString(delta)
-	return nil
+	return events
 }
 
 // handleContentDone 处理内容完成（文本/推理块）
