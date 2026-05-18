@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/codex2api/database"
@@ -292,7 +293,37 @@ func (h *Handler) Messages(c *gin.Context) {
 			translator := newAnthropicStreamTranslator(originalModel)
 			streamWriter := newStreamFlushWriter(c.Writer, flusher)
 
+			// 定时 ping goroutine：每 15 秒发一次 SSE 注释，防止客户端或中间代理因
+			// 长时间无数据（如 reasoning 阶段）触发超时断开连接。
+			pingStop := make(chan struct{})
+			var pingErr error
+			var pingMu sync.Mutex
+			go func() {
+				ticker := time.NewTicker(15 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-pingStop:
+						return
+					case <-ticker.C:
+						if err := streamWriter.WriteString(": ping\n\n"); err != nil {
+							pingMu.Lock()
+							pingErr = err
+							pingMu.Unlock()
+							return
+						}
+					}
+				}
+			}()
+
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+				pingMu.Lock()
+				pe := pingErr
+				pingMu.Unlock()
+				if pe != nil {
+					writeErr = pe
+					return false
+				}
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 
@@ -319,14 +350,6 @@ func (h *Handler) Messages(c *gin.Context) {
 
 				// 翻译并写入
 				events := translator.translateEvent(data)
-				if len(events) == 0 {
-					// 上游事件被丢弃（如 reasoning.encrypted_content.delta）时发送 SSE 注释保活，
-					// 防止客户端（Claude Code CLI）因长时间无数据而触发超时取消。
-					if err := streamWriter.WriteString(": ping\n\n"); err != nil {
-						writeErr = err
-						return false
-					}
-				}
 				for _, evt := range events {
 					sse := anthropicEventToSSE(evt)
 					if err := streamWriter.WriteString(sse); err != nil {
@@ -338,6 +361,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 				return eventType != "response.completed" && eventType != "response.failed"
 			})
+			close(pingStop)
 			if writeErr == nil {
 				writeErr = streamWriter.Flush()
 			}
