@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -130,6 +131,12 @@ func (h *Handler) Messages(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
+	var lastUpstreamCancel context.CancelFunc
+	defer func() {
+		if lastUpstreamCancel != nil {
+			lastUpstreamCancel()
+		}
+	}()
 
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
@@ -169,7 +176,12 @@ func (h *Handler) Messages(c *gin.Context) {
 
 		downstreamHeaders := c.Request.Header.Clone()
 		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		if lastUpstreamCancel != nil {
+			lastUpstreamCancel()
+		}
+		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		lastUpstreamCancel = upstreamCancel
+		resp, reqErr := ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -280,135 +292,60 @@ func (h *Handler) Messages(c *gin.Context) {
 			translator := newAnthropicStreamTranslator(originalModel)
 			streamWriter := newStreamFlushWriter(c.Writer, flusher)
 
-			// ------------------ 【终极修复：异步并发流处理架构】 ------------------
-			type sseDataBlock struct {
-				data []byte
-				err  error
-			}
-			// 创建一个带缓冲的 channel，用于接收上游读取到的每一行数据
-			streamChan := make(chan sseDataBlock, 100)
+			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+				parsed := gjson.ParseBytes(data)
+				eventType := parsed.Get("type").String()
 
-			// 1. 启动一个独立协程去阻塞读取上游 SSE
-			go func() {
-				defer close(streamChan)
-				readErr := ReadSSEStream(resp.Body, func(data []byte) bool {
-					if len(data) > 0 {
-						// 深拷贝一份 data，防止底层缓冲区复用引发并发冲突
-						buf := make([]byte, len(data))
-						copy(buf, data)
-						
-						// 如果下游客户端已经断开了，及时终止上游读取
-						select {
-						case <-c.Request.Context().Done():
-							return false
-						case streamChan <- sseDataBlock{data: buf, err: nil}:
-						}
-					}
-					return true
-				})
-				// 如果读取出错，把错误带出去
-				if readErr != nil && readErr != io.EOF {
-					select {
-					case streamChan <- sseDataBlock{data: nil, err: readErr}:
-					default:
-					}
+				// TTFT 跟踪
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
+					firstTokenMs = int(time.Since(start).Milliseconds())
+					ttftRecorded = true
 				}
-			}()
 
-			// 2. 主线程利用 Ticker 强行控场（每 3 秒无条件检查或轰击一次心跳）
-			keepAliveInterval := 3 * time.Second
-			ticker := time.NewTicker(keepAliveInterval)
-			defer ticker.Stop()
+				// 累计 delta 字符数
+				if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
+					deltaCharCount += len(parsed.Get("delta").String())
+				}
 
-			// 追踪是否需要发送最后的补齐事件
-			var lastWriteTime = time.Now()
+				// 提取 usage
+				if eventType == "response.completed" {
+					usage = extractUsageFromResult(parsed.Get("response.usage"))
+					gotTerminal = true
+				}
+				if eventType == "response.failed" {
+					terminalFailurePayload = append([]byte(nil), data...)
+					gotTerminal = true
+				}
 
-		Loop:
-			for {
-				select {
-				case <-c.Request.Context().Done():
-					// 下游客户端最终放弃了连接
-					break Loop
-
-				case block, ok := <-streamChan:
-					if !ok {
-						// 上游通道正常关闭，说明流读完了
-						break Loop
-					}
-
-					if block.err != nil {
-						readErr = block.err
-						break Loop
-					}
-
-					// 恢复原有的业务翻译逻辑
-					parsed := gjson.ParseBytes(block.data)
-					eventType := parsed.Get("type").String()
-
-					// TTFT 跟踪
-					if !ttftRecorded && isFirstTokenEvent(eventType) {
-						firstTokenMs = int(time.Since(start).Milliseconds())
-						ttftRecorded = true
-					}
-
-					// 累计 delta 字符数
-					if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
-						deltaCharCount += len(parsed.Get("delta").String())
-					}
-
-					// 提取 usage
-					if eventType == "response.completed" {
-						usage = extractUsageFromResult(parsed.Get("response.usage"))
-						gotTerminal = true
-					}
-					if eventType == "response.failed" {
-						terminalFailurePayload = append([]byte(nil), block.data...)
-						gotTerminal = true
-					}
-
-					// 翻译并写入下游
-					events := translator.translateEvent(block.data)
-					for _, evt := range events {
-						sse := anthropicEventToSSE(evt)
-						if err := streamWriter.WriteString(sse); err != nil {
-							writeErr = err
-							break Loop
-						}
-						wroteAnyBody = true
-						lastWriteTime = time.Now() // 刷新真实写入时间
-					}
-
-					// 翻译正常，但如果遇到拦截工具链参数导致 events 为空，且空窗期超限
-					if len(events) == 0 && time.Since(lastWriteTime) > keepAliveInterval {
-						if err := streamWriter.WriteString(": keepalive\n\n"); err != nil {
-							writeErr = err
-							break Loop
-						}
-						lastWriteTime = time.Now()
-					}
-					// 收到任何有效包都重置 Ticker
-					ticker.Reset(keepAliveInterval)
-
-				case <-ticker.C:
-					// 【核心兜底逻辑】
-					// 走到这里意味着：在整整 3 秒钟内，streamChan 里既没有新数据（上游卡住了），
-					// 也没有发生关闭。不管是因为上游在大力思考，还是网络抖动，
-					// 强行向下游轰击一条标准 SSE 注释，把长连接死死续住！
-					if err := streamWriter.WriteString(": keepalive\n\n"); err != nil {
+				// 翻译并写入
+				events := translator.translateEvent(data)
+				if len(events) == 0 {
+					// 上游事件被丢弃（如 reasoning.encrypted_content.delta）时发送 SSE 注释保活，
+					// 防止客户端（Claude Code CLI）因长时间无数据而触发超时取消。
+					if err := streamWriter.WriteString(": ping\n\n"); err != nil {
 						writeErr = err
-						break Loop
+						return false
 					}
-					lastWriteTime = time.Now()
 				}
-			}
+				for _, evt := range events {
+					sse := anthropicEventToSSE(evt)
+					if err := streamWriter.WriteString(sse); err != nil {
+						writeErr = err
+						return false
+					}
+					wroteAnyBody = true
+				}
 
-			// 3. 收尾逻辑：流结束后补齐事件
+				return eventType != "response.completed" && eventType != "response.failed"
+			})
 			if writeErr == nil {
-				_ = streamWriter.Flush()
+				writeErr = streamWriter.Flush()
 			}
 
+			// 流结束后补齐事件
 			if writeErr == nil {
 				finalEvents := translator.finalize()
+				// 仅在 message_stop 未发送过时输出
 				if !gotTerminal {
 					for _, evt := range finalEvents {
 						sse := anthropicEventToSSE(evt)
@@ -418,11 +355,10 @@ func (h *Handler) Messages(c *gin.Context) {
 						}
 					}
 					if writeErr == nil {
-						_ = streamWriter.Flush()
+						writeErr = streamWriter.Flush()
 					}
 				}
 			}
-			// -------------------------------------------------------------------
 		} else {
 			// 非流式：缓冲所有事件后构建完整 JSON 响应
 			var lastCompletedData []byte
