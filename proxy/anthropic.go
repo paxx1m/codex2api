@@ -606,9 +606,14 @@ func (t *anthropicStreamTranslator) translateEvent(eventData []byte) []anthropic
 	case "response.function_call_arguments.done":
 		return t.handleToolInputDone(eventData)
 
-	case "response.output_text.done", "response.reasoning_summary_text.done",
-		"response.reasoning_text.done":
+	case "response.output_text.done":
 		return t.handleContentDone()
+
+	// reasoning_summary_text.done must NOT close the thinking block — a single
+	// reasoning output item can contain multiple summary parts, so the block
+	// must stay open until response.output_item.done arrives.
+	case "response.reasoning_summary_text.done", "response.reasoning_text.done":
+		return nil
 
 	case "response.output_item.done":
 		return t.handleOutputItemDone(eventData)
