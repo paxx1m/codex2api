@@ -800,8 +800,9 @@ func (t *anthropicStreamTranslator) handleToolInputDelta(data []byte) []anthropi
 	return events
 }
 
-// handleToolInputDone 处理工具调用参数完成事件。
-// 当上游跳过所有 delta 直接发 done 时，从 done 事件的 arguments 字段读取完整参数。
+// handleToolInputDone handles the function_call_arguments.done event.
+// When upstream skips all delta events and sends only done, emit the full
+// arguments as a single input_json_delta immediately (same as CLIProxyAPI).
 func (t *anthropicStreamTranslator) handleToolInputDone(data []byte) []anthropicStreamEvent {
 	if t.hasReceivedArgsDelta {
 		return nil
@@ -810,8 +811,19 @@ func (t *anthropicStreamTranslator) handleToolInputDone(data []byte) []anthropic
 	if args == "" {
 		return nil
 	}
-	t.currentToolInputBuffer.WriteString(args)
-	return nil
+	cleaned := sanitizeToolInputJSON(args)
+	if cleaned == "" {
+		return nil
+	}
+	idx := t.contentBlockIndex - 1
+	return []anthropicStreamEvent{{
+		Type:  "content_block_delta",
+		Index: &idx,
+		Delta: &anthropicDelta{
+			Type:        "input_json_delta",
+			PartialJSON: cleaned,
+		},
+	}}
 }
 
 // handleContentDone 处理内容完成（文本/推理块）
