@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,12 +14,14 @@ import (
 )
 
 var (
-	debugLogFile *os.File
-	debugLogOnce sync.Once
-	debugLogMu   sync.Mutex
+	debugLogFile    *os.File
+	debugLogOnce    sync.Once
+	debugLogMu      sync.Mutex
+	debugLastMsg    string
+	debugReqCounter atomic.Int64
 )
 
-func debugLog(format string, args ...any) {
+func debugLogReq(id int64, format string, args ...any) {
 	debugLogOnce.Do(func() {
 		f, err := os.OpenFile("/data/codex2api_debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err == nil {
@@ -28,10 +31,22 @@ func debugLog(format string, args ...any) {
 	if debugLogFile == nil {
 		return
 	}
-	msg := fmt.Sprintf("[%s] "+format+"\n", append([]any{time.Now().Format("15:04:05.000")}, args...)...)
+	body := fmt.Sprintf("[%d] "+format, append([]any{id}, args...)...)
 	debugLogMu.Lock()
-	debugLogFile.WriteString(msg)
-	debugLogMu.Unlock()
+	defer debugLogMu.Unlock()
+	if body == debugLastMsg {
+		return
+	}
+	debugLastMsg = body
+	debugLogFile.WriteString("[" + time.Now().Format("15:04:05.000") + "] " + body + "\n")
+}
+
+// truncate shortens a string for log display
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // ==================== Anthropic Messages API 类型定义 ====================
@@ -557,6 +572,7 @@ func convertAnthropicToolChoice(raw json.RawMessage) any {
 
 // anthropicStreamTranslator 有状态的流式响应翻译器（Codex → Anthropic）
 type anthropicStreamTranslator struct {
+	reqID                   int64
 	model                   string
 	responseID              string
 	messageStartSent        bool
@@ -576,6 +592,7 @@ type anthropicStreamTranslator struct {
 // newAnthropicStreamTranslator 创建流式翻译器
 func newAnthropicStreamTranslator(model string) *anthropicStreamTranslator {
 	return &anthropicStreamTranslator{
+		reqID:      debugReqCounter.Add(1),
 		model:      model,
 		responseID: "msg_" + uuid.New().String()[:24],
 	}
@@ -584,8 +601,14 @@ func newAnthropicStreamTranslator(model string) *anthropicStreamTranslator {
 // translateEvent 将单个 Codex SSE 事件翻译为零或多个 Anthropic SSE 事件
 func (t *anthropicStreamTranslator) translateEvent(eventData []byte) []anthropicStreamEvent {
 	eventType := gjson.GetBytes(eventData, "type").String()
-	debugLog("EVENT type=%s blockOpen=%v blockType=%s blockIdx=%d hasArgsDelta=%v",
-		eventType, t.contentBlockOpen, t.currentBlockType, t.contentBlockIndex, t.hasReceivedArgsDelta)
+
+	// Log only state-changing events, not high-frequency deltas
+	switch eventType {
+	case "response.created", "response.output_item.added", "response.output_item.done",
+		"response.function_call_arguments.done", "response.completed", "response.failed":
+		debugLogReq(t.reqID, "EVENT type=%s blockOpen=%v blockType=%s blockIdx=%d hasArgsDelta=%v",
+			eventType, t.contentBlockOpen, t.currentBlockType, t.contentBlockIndex, t.hasReceivedArgsDelta)
+	}
 
 	switch eventType {
 	case "response.created":
@@ -687,7 +710,7 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 		t.currentToolUseName = name
 		t.hasToolUse = true
 		t.hasReceivedArgsDelta = false
-		debugLog("OUTPUT_ITEM_ADDED function_call name=%s callID=%s idx=%d", name, callID, idx)
+		debugLogReq(t.reqID, "OUTPUT_ITEM_ADDED function_call name=%s callID=%s idx=%d", name, callID, idx)
 		events = append(events, anthropicStreamEvent{
 			Type:  "content_block_start",
 			Index: &idx,
@@ -807,7 +830,7 @@ func (t *anthropicStreamTranslator) handleToolInputDelta(data []byte) []anthropi
 		events = append(events, t.handleCreated()...)
 	}
 	if !t.contentBlockOpen || t.currentBlockType != "tool_use" {
-		debugLog("ARGS_DELTA lazy-open tool_use name=%s callID=%s blockWas=%s blockOpen=%v",
+		debugLogReq(t.reqID, "ARGS_DELTA lazy-open tool_use name=%s callID=%s blockWas=%s blockOpen=%v",
 			t.currentToolUseName, t.currentToolUseID, t.currentBlockType, t.contentBlockOpen)
 		events = append(events, t.closeCurrentBlock()...)
 		callID := t.currentToolUseID
@@ -830,7 +853,9 @@ func (t *anthropicStreamTranslator) handleToolInputDelta(data []byte) []anthropi
 		})
 	}
 
-	debugLog("ARGS_DELTA tool=%s delta=%q", t.currentToolUseName, delta)
+	if !t.hasReceivedArgsDelta {
+		debugLogReq(t.reqID, "ARGS_DELTA first tool=%s delta=%s", t.currentToolUseName, truncate(delta, 80))
+	}
 	t.hasReceivedArgsDelta = true
 	t.currentToolInputBuffer.WriteString(delta)
 	return events
@@ -841,8 +866,8 @@ func (t *anthropicStreamTranslator) handleToolInputDelta(data []byte) []anthropi
 // arguments as a single input_json_delta immediately (same as CLIProxyAPI).
 func (t *anthropicStreamTranslator) handleToolInputDone(data []byte) []anthropicStreamEvent {
 	args := gjson.GetBytes(data, "arguments").String()
-	debugLog("ARGS_DONE tool=%s hasReceivedDelta=%v args=%q blockOpen=%v blockType=%s blockIdx=%d",
-		t.currentToolUseName, t.hasReceivedArgsDelta, args, t.contentBlockOpen, t.currentBlockType, t.contentBlockIndex)
+	debugLogReq(t.reqID, "ARGS_DONE tool=%s hasReceivedDelta=%v args=%s blockOpen=%v blockIdx=%d",
+		t.currentToolUseName, t.hasReceivedArgsDelta, truncate(args, 120), t.contentBlockOpen, t.contentBlockIndex)
 	if t.hasReceivedArgsDelta {
 		return nil
 	}
@@ -854,7 +879,7 @@ func (t *anthropicStreamTranslator) handleToolInputDone(data []byte) []anthropic
 		return nil
 	}
 	idx := t.contentBlockIndex - 1
-	debugLog("ARGS_DONE emitting input_json_delta idx=%d cleaned=%q", idx, cleaned)
+	debugLogReq(t.reqID, "ARGS_DONE emit idx=%d cleaned=%s", idx, truncate(cleaned, 120))
 	return []anthropicStreamEvent{{
 		Type:  "content_block_delta",
 		Index: &idx,
@@ -873,7 +898,7 @@ func (t *anthropicStreamTranslator) handleContentDone() []anthropicStreamEvent {
 // handleOutputItemDone 处理输出项完成
 func (t *anthropicStreamTranslator) handleOutputItemDone(data []byte) []anthropicStreamEvent {
 	itemType := gjson.GetBytes(data, "item.type").String()
-	debugLog("OUTPUT_ITEM_DONE itemType=%s tool=%s blockOpen=%v bufLen=%d hasArgsDelta=%v",
+	debugLogReq(t.reqID, "OUTPUT_ITEM_DONE itemType=%s tool=%s blockOpen=%v bufLen=%d hasArgsDelta=%v",
 		itemType, t.currentToolUseName, t.contentBlockOpen, t.currentToolInputBuffer.Len(), t.hasReceivedArgsDelta)
 	return t.closeCurrentBlock()
 }
@@ -958,11 +983,11 @@ func (t *anthropicStreamTranslator) closeCurrentBlock() []anthropicStreamEvent {
 	var events []anthropicStreamEvent
 	if t.currentBlockType == "tool_use" {
 		bufLen := t.currentToolInputBuffer.Len()
-		debugLog("CLOSE_BLOCK tool=%s bufLen=%d hasReceivedDelta=%v idx=%d",
+		debugLogReq(t.reqID, "CLOSE_BLOCK tool=%s bufLen=%d hasReceivedDelta=%v idx=%d",
 			t.currentToolUseName, bufLen, t.hasReceivedArgsDelta, idx)
 		if bufLen > 0 {
 			cleaned := sanitizeToolInputJSON(t.currentToolInputBuffer.String())
-			debugLog("CLOSE_BLOCK cleaned=%q", cleaned)
+			debugLogReq(t.reqID, "CLOSE_BLOCK emit cleaned=%s", truncate(cleaned, 120))
 			if cleaned != "" {
 				events = append(events, anthropicStreamEvent{
 					Type:  "content_block_delta",
