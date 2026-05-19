@@ -903,8 +903,8 @@ func (t *anthropicStreamTranslator) handleContentDone() []anthropicStreamEvent {
 // handleOutputItemDone 处理输出项完成
 func (t *anthropicStreamTranslator) handleOutputItemDone(data []byte) []anthropicStreamEvent {
 	itemType := gjson.GetBytes(data, "item.type").String()
-	debugLogReq(t.reqID, "OUTPUT_ITEM_DONE itemType=%s tool=%s blockOpen=%v bufLen=%d hasArgsDelta=%v",
-		itemType, t.currentToolUseName, t.contentBlockOpen, t.currentToolInputBuffer.Len(), t.hasReceivedArgsDelta)
+	debugLogReq(t.reqID, "OUTPUT_ITEM_DONE itemType=%s tool=%s blockOpen=%v hasArgsDelta=%v",
+		itemType, t.currentToolUseName, t.contentBlockOpen, t.hasReceivedArgsDelta)
 	return t.closeCurrentBlock()
 }
 
