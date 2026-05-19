@@ -542,6 +542,7 @@ type anthropicStreamTranslator struct {
 	currentToolUseName      string
 	currentToolInputBuffer  strings.Builder
 	hasToolUse              bool
+	hasReceivedArgsDelta    bool
 	inputTokens             int
 	outputTokens            int
 	cachedTokens            int
@@ -574,6 +575,9 @@ func (t *anthropicStreamTranslator) translateEvent(eventData []byte) []anthropic
 
 	case "response.function_call_arguments.delta":
 		return t.handleToolInputDelta(eventData)
+
+	case "response.function_call_arguments.done":
+		return t.handleToolInputDone(eventData)
 
 	case "response.output_text.done", "response.reasoning_summary_text.done",
 		"response.reasoning_text.done":
@@ -650,6 +654,7 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 		t.currentToolUseID = callID
 		t.currentToolUseName = name
 		t.hasToolUse = true
+		t.hasReceivedArgsDelta = false
 		events = append(events, anthropicStreamEvent{
 			Type:  "content_block_start",
 			Index: &idx,
@@ -777,6 +782,7 @@ func (t *anthropicStreamTranslator) handleToolInputDelta(data []byte) []anthropi
 		t.contentBlockOpen = true
 		t.currentBlockType = "tool_use"
 		t.hasToolUse = true
+		t.hasReceivedArgsDelta = false
 		events = append(events, anthropicStreamEvent{
 			Type:  "content_block_start",
 			Index: &idx,
@@ -789,8 +795,23 @@ func (t *anthropicStreamTranslator) handleToolInputDelta(data []byte) []anthropi
 		})
 	}
 
+	t.hasReceivedArgsDelta = true
 	t.currentToolInputBuffer.WriteString(delta)
 	return events
+}
+
+// handleToolInputDone 处理工具调用参数完成事件。
+// 当上游跳过所有 delta 直接发 done 时，从 done 事件的 arguments 字段读取完整参数。
+func (t *anthropicStreamTranslator) handleToolInputDone(data []byte) []anthropicStreamEvent {
+	if t.hasReceivedArgsDelta {
+		return nil
+	}
+	args := gjson.GetBytes(data, "arguments").String()
+	if args == "" {
+		return nil
+	}
+	t.currentToolInputBuffer.WriteString(args)
+	return nil
 }
 
 // handleContentDone 处理内容完成（文本/推理块）
