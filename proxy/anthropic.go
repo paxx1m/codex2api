@@ -572,21 +572,20 @@ func convertAnthropicToolChoice(raw json.RawMessage) any {
 
 // anthropicStreamTranslator 有状态的流式响应翻译器（Codex → Anthropic）
 type anthropicStreamTranslator struct {
-	reqID                   int64
-	model                   string
-	responseID              string
-	messageStartSent        bool
-	contentBlockIndex       int
-	contentBlockOpen        bool
-	currentBlockType        string // "text" | "thinking" | "tool_use"
-	currentToolUseID        string
-	currentToolUseName      string
-	currentToolInputBuffer  strings.Builder
-	hasToolUse              bool
-	hasReceivedArgsDelta    bool
-	inputTokens             int
-	outputTokens            int
-	cachedTokens            int
+	reqID                int64
+	model                string
+	responseID           string
+	messageStartSent     bool
+	contentBlockIndex    int
+	contentBlockOpen     bool
+	currentBlockType     string // "text" | "thinking" | "tool_use"
+	currentToolUseID     string
+	currentToolUseName   string
+	hasToolUse           bool
+	hasReceivedArgsDelta bool
+	inputTokens          int
+	outputTokens         int
+	cachedTokens         int
 }
 
 // newAnthropicStreamTranslator 创建流式翻译器
@@ -813,18 +812,15 @@ func (t *anthropicStreamTranslator) handleThinkingDelta(data []byte) []anthropic
 	return events
 }
 
-// handleToolInputDelta 缓冲工具调用参数增量。
-// 不直接转发为 input_json_delta：上游模型偶尔会塞入空可选字段（如 gpt-5.5
-// 给 Read 工具加 "pages":""），逐片透传后下游会看到污染后的入参。统一在
-// closeCurrentBlock 时整段清洗后一次性下发。
+// handleToolInputDelta emits each argument fragment immediately as input_json_delta.
+// Previously buffered until closeCurrentBlock, but that caused 50+ second silences
+// on large tool calls (e.g. Write), triggering client-side timeouts and broken pipe.
 func (t *anthropicStreamTranslator) handleToolInputDelta(data []byte) []anthropicStreamEvent {
 	delta := gjson.GetBytes(data, "delta").String()
 	if delta == "" {
 		return nil
 	}
 
-	// 如果 response.output_item.added 没有触发（上游跳过），在此懒开 tool_use block，
-	// 防止 content_block_stop 在没有对应 content_block_start 的情况下发出。
 	var events []anthropicStreamEvent
 	if !t.messageStartSent {
 		events = append(events, t.handleCreated()...)
@@ -857,7 +853,16 @@ func (t *anthropicStreamTranslator) handleToolInputDelta(data []byte) []anthropi
 		debugLogReq(t.reqID, "ARGS_DELTA first tool=%s delta=%s", t.currentToolUseName, truncate(delta, 80))
 	}
 	t.hasReceivedArgsDelta = true
-	t.currentToolInputBuffer.WriteString(delta)
+
+	idx := t.contentBlockIndex - 1
+	events = append(events, anthropicStreamEvent{
+		Type:  "content_block_delta",
+		Index: &idx,
+		Delta: &anthropicDelta{
+			Type:        "input_json_delta",
+			PartialJSON: delta,
+		},
+	})
 	return events
 }
 
@@ -980,33 +985,15 @@ func (t *anthropicStreamTranslator) closeCurrentBlock() []anthropicStreamEvent {
 	t.contentBlockOpen = false
 	idx := t.contentBlockIndex - 1
 
-	var events []anthropicStreamEvent
 	if t.currentBlockType == "tool_use" {
-		bufLen := t.currentToolInputBuffer.Len()
-		debugLogReq(t.reqID, "CLOSE_BLOCK tool=%s bufLen=%d hasReceivedDelta=%v idx=%d",
-			t.currentToolUseName, bufLen, t.hasReceivedArgsDelta, idx)
-		if bufLen > 0 {
-			cleaned := sanitizeToolInputJSON(t.currentToolInputBuffer.String())
-			debugLogReq(t.reqID, "CLOSE_BLOCK emit cleaned=%s", truncate(cleaned, 120))
-			if cleaned != "" {
-				events = append(events, anthropicStreamEvent{
-					Type:  "content_block_delta",
-					Index: &idx,
-					Delta: &anthropicDelta{
-						Type:        "input_json_delta",
-						PartialJSON: cleaned,
-					},
-				})
-			}
-			t.currentToolInputBuffer.Reset()
-		}
+		debugLogReq(t.reqID, "CLOSE_BLOCK tool=%s hasReceivedDelta=%v idx=%d",
+			t.currentToolUseName, t.hasReceivedArgsDelta, idx)
 	}
 
-	events = append(events, anthropicStreamEvent{
+	return []anthropicStreamEvent{{
 		Type:  "content_block_stop",
 		Index: &idx,
-	})
-	return events
+	}}
 }
 
 // sanitizeToolInputJSON 清洗工具调用 arguments JSON：
