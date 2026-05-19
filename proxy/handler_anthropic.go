@@ -274,6 +274,10 @@ func (h *Handler) Messages(c *gin.Context) {
 		var writeErr error
 		wroteAnyBody := false
 		var terminalFailurePayload []byte
+		var lastSentEventType string
+		var sentEventCount int
+
+		var reqID int64
 
 		if isStream {
 			// 流式响应：逐事件翻译为 Anthropic SSE
@@ -292,6 +296,8 @@ func (h *Handler) Messages(c *gin.Context) {
 
 			translator := newAnthropicStreamTranslator(originalModel)
 			streamWriter := newStreamFlushWriter(c.Writer, flusher)
+			reqID = translator.reqID
+			debugLogReq(reqID, "REQ_START model=%s stream=true attempt=%d", originalModel, attempt+1)
 
 			// 定时 ping goroutine：每 15 秒发一次 SSE 注释，防止客户端或中间代理因
 			// 长时间无数据（如 reasoning 阶段）触发超时断开连接。
@@ -307,6 +313,8 @@ func (h *Handler) Messages(c *gin.Context) {
 						return
 					case <-ticker.C:
 						if err := streamWriter.WriteString(": ping\n\n"); err != nil {
+							debugLogReq(reqID, "PING_ERR lastSentEvent=%s sentCount=%d err=%v",
+								lastSentEventType, sentEventCount, err)
 							pingMu.Lock()
 							pingErr = err
 							pingMu.Unlock()
@@ -353,9 +361,13 @@ func (h *Handler) Messages(c *gin.Context) {
 				for _, evt := range events {
 					sse := anthropicEventToSSE(evt)
 					if err := streamWriter.WriteString(sse); err != nil {
+						debugLogReq(reqID, "WRITE_ERR upstreamEvent=%s lastSentEvent=%s sentCount=%d chars=%d err=%v",
+							eventType, lastSentEventType, sentEventCount, deltaCharCount, err)
 						writeErr = err
 						return false
 					}
+					lastSentEventType = evt.Type
+					sentEventCount++
 					wroteAnyBody = true
 				}
 
@@ -426,6 +438,11 @@ func (h *Handler) Messages(c *gin.Context) {
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
 		}
+		if outcome.logStatusCode != http.StatusOK {
+			debugLogReq(reqID, "STREAM_END status=%d lastSentEvent=%s sentCount=%d chars=%d readErr=%v writeErr=%v ctxErr=%v",
+				outcome.logStatusCode, lastSentEventType, sentEventCount, deltaCharCount, readErr, writeErr, c.Request.Context().Err())
+		}
+		debugLogReq(reqID, "REQ_END status=%d\n", outcome.logStatusCode)
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重试 (attempt %d/%d, account %d, /v1/messages): %s",
 				attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
